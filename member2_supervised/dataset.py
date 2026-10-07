@@ -1,7 +1,5 @@
-from __future__ import annotations
-
-from pathlib import Path
-
+# member2_supervised/dataset.py
+import os
 import pandas as pd
 import torch
 from PIL import Image
@@ -9,105 +7,79 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 
 
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
-
-
-def build_train_transform(image_size: int = 224):
-    return transforms.Compose(
-        [
-            transforms.Resize(
-                (image_size, image_size),
-                antialias=True,
-            ),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(degrees=10),
-            transforms.ColorJitter(
-                brightness=0.15,
-                contrast=0.15,
-                saturation=0.10,
-                hue=0.02,
-            ),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=IMAGENET_MEAN,
-                std=IMAGENET_STD,
-            ),
-        ]
-    )
-
-
-def build_eval_transform(image_size: int = 224):
-    return transforms.Compose(
-        [
-            transforms.Resize(
-                (image_size, image_size),
-                antialias=True,
-            ),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=IMAGENET_MEAN,
-                std=IMAGENET_STD,
-            ),
-        ]
-    )
-
-
-class SupervisedDefectDataset(Dataset):
+class DefectDataset(Dataset):
     """
-    Dataset used exclusively by Member 2's supervised experiments.
-
-    The original metadata files are never modified.
+    Binary image-level classifier dataset.
+    Reads team metadata CSV, remaps Windows paths to Colab/Kaggle paths.
     """
+    def __init__(self, csv_file, root_dir, split=None, transform=None,
+                 return_path=False):
+        self.df = pd.read_csv(csv_file)
+        if split is not None and "split" in self.df.columns:
+            self.df = self.df[self.df["split"] == split].reset_index(drop=True)
 
-    def __init__(
-        self,
-        metadata_csv: str | Path,
-        transform=None,
-    ):
-        self.metadata = pd.read_csv(metadata_csv).reset_index(drop=True)
-
-        required = {
-            "image_path",
-            "label",
-            "category",
-            "defect_type",
-        }
-
-        missing = required - set(self.metadata.columns)
-
-        if missing:
-            raise ValueError(
-                f"Missing required columns: {sorted(missing)}"
-            )
-
+        self.root_dir = str(root_dir)
         self.transform = transform
+        self.return_path = return_path
 
-    def __len__(self) -> int:
-        return len(self.metadata)
+        # Remap paths
+        self.df["full_path"] = self.df["image_path"].apply(self._remap)
+        self.df["mask_full_path"] = self.df["mask_path"].apply(self._remap)
 
-    def __getitem__(self, index: int) -> dict:
-        row = self.metadata.iloc[index]
+        # Drop missing files
+        before = len(self.df)
+        self.df = self.df[self.df["full_path"].apply(os.path.exists)].reset_index(drop=True)
+        if before != len(self.df):
+            print(f"[DefectDataset] Dropped {before - len(self.df)} missing files "
+                  f"({len(self.df)} remain) from {csv_file}")
 
-        image_path = Path(row["image_path"])
+    def _remap(self, p):
+        if pd.isna(p) or p == "" or p is None:
+            return ""
+        p = str(p).replace("\\", "/")
+        for key in ("mvtec_anomaly_detection/", "VisA_20220922/"):
+            if key in p:
+                rel = p.split(key, 1)[1]
+                return os.path.join(self.root_dir, rel)
+        return p
 
-        if not image_path.exists():
-            raise FileNotFoundError(
-                f"Image does not exist: {image_path}"
-            )
+    def __len__(self):
+        return len(self.df)
 
-        image = Image.open(image_path).convert("RGB")
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        try:
+            img = Image.open(row["full_path"]).convert("RGB")
+        except Exception:
+            img = Image.new("RGB", (288, 288))
 
-        if self.transform is not None:
-            image = self.transform(image)
+        label = int(row["label"])
+        if self.transform:
+            img = self.transform(img)
 
-        return {
-            "image": image,
-            "label": torch.tensor(
-                int(row["label"]),
-                dtype=torch.long,
-            ),
-            "category": row["category"],
-            "defect_type": row["defect_type"],
-            "image_path": str(image_path),
-        }
+        if self.return_path:
+            return img, torch.tensor(label, dtype=torch.long), row["full_path"]
+        return img, torch.tensor(label, dtype=torch.long)
+
+
+def build_transforms(img_size=288, train=True):
+    normalize = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std =[0.229, 0.224, 0.225],
+    )
+    if train:
+        return transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomRotation(15),
+            transforms.ColorJitter(0.2, 0.2, 0.2, 0.05),
+            transforms.ToTensor(),
+            normalize,
+            transforms.RandomErasing(p=0.25, scale=(0.02, 0.1)),
+        ])
+    return transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),
+        normalize,
+    ])

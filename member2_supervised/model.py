@@ -1,43 +1,25 @@
-from __future__ import annotations
-
+# member2_supervised/model.py
 import torch
-from torch import nn
-from torchvision.models import ResNet18_Weights, resnet18
+import torch.nn as nn
+import timm
 
 
-class ResNet18DefectClassifier(nn.Module):
+class DefectClassifier(nn.Module):
     """
-    Image-level binary defect classifier.
-
-    Output:
-        logits of shape [batch_size, 2]
-
-    Class mapping:
-        0 -> normal
-        1 -> defective
+    Wraps any timm backbone (convnext_tiny, resnet50, efficientnet_b3 ...).
     """
-
-    def __init__(
-        self,
-        pretrained: bool = True,
-        dropout: float = 0.2,
-    ) -> None:
+    def __init__(self, model_name="convnext_tiny", num_classes=2,
+                 pretrained=True, dropout=0.3):
         super().__init__()
-
-        weights = (
-            ResNet18_Weights.DEFAULT
-            if pretrained
-            else None
+        self.backbone = timm.create_model(
+            model_name, pretrained=pretrained, num_classes=0, global_pool="avg"
+        )
+        feat_dim = self.backbone.num_features
+        self.head = nn.Sequential(
+            nn.LayerNorm(feat_dim),
+            nn.Dropout(dropout),
+            nn.Linear(feat_dim, num_classes),
         )
 
-        self.backbone = resnet18(weights=weights)
-
-        num_features = self.backbone.fc.in_features
-
-        self.backbone.fc = nn.Sequential(
-            nn.Dropout(p=dropout),
-            nn.Linear(num_features, 2),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.backbone(x)
+    def forward(self, x):
+        return self.head(self.backbone(x))

@@ -1,319 +1,98 @@
-from __future__ import annotations
-
-import argparse
-import random
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
+# member2_supervised/train.py
+import copy, json, time
 import torch
-from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-)
-from torch import nn
-from torch.optim import AdamW
-from torch.utils.data import DataLoader
-
-from dataset import (
-    SupervisedDefectDataset,
-    build_eval_transform,
-    build_train_transform,
-)
-from model import ResNet18DefectClassifier
-
-
-SEED = 42
-
-
-def seed_everything(seed: int = SEED) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-def compute_class_weights(labels: pd.Series) -> torch.Tensor:
-    counts = labels.value_counts().sort_index()
-
-    weights = len(labels) / (
-        2.0 * counts.astype(float)
-    )
-
-    return torch.tensor(
-        weights.values,
-        dtype=torch.float32,
-    )
-
-
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-):
-    model.eval()
-
-    y_true = []
-    y_pred = []
-    y_prob = []
-
-    with torch.no_grad():
-        for batch in loader:
-            images = batch["image"].to(device)
-            labels = batch["label"].to(device)
-
-            logits = model(images)
-            probabilities = torch.softmax(
-                logits,
-                dim=1,
-            )[:, 1]
-
-            predictions = (
-                probabilities >= 0.5
-            ).long()
-
-            y_true.extend(labels.cpu().numpy())
-            y_pred.extend(predictions.cpu().numpy())
-            y_prob.extend(probabilities.cpu().numpy())
-
-    metrics = {
-        "accuracy": accuracy_score(y_true, y_pred),
-        "precision": precision_score(
-            y_true,
-            y_pred,
-            zero_division=0,
-        ),
-        "recall": recall_score(
-            y_true,
-            y_pred,
-            zero_division=0,
-        ),
-        "f1": f1_score(
-            y_true,
-            y_pred,
-            zero_division=0,
-        ),
-        "auroc": roc_auc_score(
-            y_true,
-            y_prob,
-        ),
-    }
-
-    return metrics
-
-
-def train(args):
-    seed_everything()
-
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
-
-    print("Device:", device)
-
-    train_dataset = SupervisedDefectDataset(
-        args.train_csv,
-        transform=build_train_transform(
-            args.image_size
-        ),
-    )
-
-    val_dataset = SupervisedDefectDataset(
-        args.val_csv,
-        transform=build_eval_transform(
-            args.image_size
-        ),
-    )
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-    )
-
-    class_weights = compute_class_weights(
-        train_dataset.metadata["label"]
-    ).to(device)
-
-    print("Class weights:", class_weights)
-
-    model = ResNet18DefectClassifier(
-        pretrained=True
-    ).to(device)
-
-    criterion = nn.CrossEntropyLoss(
-        weight=class_weights
-    )
-
-    optimizer = AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=1e-4,
-    )
-
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="max",
-        factor=0.5,
-        patience=2,
-    )
-
-    best_f1 = -float("inf")
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    for epoch in range(1, args.epochs + 1):
-
-        model.train()
-
-        running_loss = 0.0
-
-        for batch in train_loader:
-            images = batch["image"].to(device)
-            labels = batch["label"].to(device)
-
-            optimizer.zero_grad(set_to_none=True)
-
-            logits = model(images)
-
-            loss = criterion(
-                logits,
-                labels,
-            )
-
-            loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                max_norm=1.0,
-            )
-
-            optimizer.step()
-
-            running_loss += (
-                loss.item() * images.size(0)
-            )
-
-        train_loss = (
-            running_loss / len(train_dataset)
-        )
-
-        val_metrics = evaluate(
-            model,
-            val_loader,
-            device,
-        )
-
-        scheduler.step(
-            val_metrics["f1"]
-        )
-
-        print(
-            f"Epoch {epoch:02d} | "
-            f"loss={train_loss:.4f} | "
-            f"val_acc={val_metrics['accuracy']:.4f} | "
-            f"val_precision={val_metrics['precision']:.4f} | "
-            f"val_recall={val_metrics['recall']:.4f} | "
-            f"val_f1={val_metrics['f1']:.4f} | "
-            f"val_auc={val_metrics['auroc']:.4f}"
-        )
-
-        if val_metrics["f1"] > best_f1:
-
-            best_f1 = val_metrics["f1"]
-
-            checkpoint = {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_metrics": val_metrics,
-                "class_weights": class_weights.cpu(),
-            }
-
-            torch.save(
-                checkpoint,
-                output_dir / "best_model.pt",
-            )
-
-            print(
-                f"Saved best model "
-                f"(F1={best_f1:.4f})"
-            )
-
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--train-csv",
-        required=True,
-    )
-
-    parser.add_argument(
-        "--val-csv",
-        required=True,
-    )
-
-    parser.add_argument(
-        "--output-dir",
-        default="outputs/supervised",
-    )
-
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=15,
-    )
-
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=32,
-    )
-
-    parser.add_argument(
-        "--learning-rate",
-        type=float,
-        default=3e-4,
-    )
-
-    parser.add_argument(
-        "--image-size",
-        type=int,
-        default=224,
-    )
-
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=0,
-    )
-
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    args = parse_args()
-    train(args)
+import torch.nn as nn
+from torch.utils.data import DataLoader, random_split
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+
+from config import (IMG_SIZE, BATCH_SIZE, EPOCHS, LR, WEIGHT_DECAY, WARMUP_EPOCHS,
+                    LABEL_SMOOTHING, NUM_WORKERS, DEVICE, CKPT_DIR, RESULTS_DIR,
+                    MODEL_NAME, NUM_CLASSES, PRETRAINED, DROPOUT,
+                    FOCAL_ALPHA, FOCAL_GAMMA, EARLY_STOP_PATIENCE)
+from dataset import DefectDataset, build_transforms
+from model import DefectClassifier
+from losses import FocalLoss
+from engine import train_one_epoch, evaluate
+
+
+def make_loaders(csv_file, root_dir, img_size=IMG_SIZE, batch_size=BATCH_SIZE,
+                 val_frac=0.1):
+    train_full = DefectDataset(csv_file, root_dir, split="train",
+                               transform=build_transforms(img_size, True))
+    val_full = DefectDataset(csv_file, root_dir, split="train",
+                             transform=build_transforms(img_size, False))
+    n = len(train_full)
+    val_size = max(1, int(val_frac * n))
+    train_size = n - val_size
+    g = torch.Generator().manual_seed(42)
+    idx_train, idx_val = torch.randperm(n, generator=g).split([train_size, val_size])
+    train_subset = torch.utils.data.Subset(train_full, idx_train.tolist())
+    val_subset   = torch.utils.data.Subset(val_full,   idx_val.tolist())
+
+    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True,
+                              num_workers=NUM_WORKERS, pin_memory=True, drop_last=False)
+    val_loader   = DataLoader(val_subset, batch_size=batch_size, shuffle=False,
+                              num_workers=NUM_WORKERS, pin_memory=True)
+    return train_loader, val_loader
+
+
+def build_model():
+    return DefectClassifier(MODEL_NAME, NUM_CLASSES, PRETRAINED, DROPOUT).to(DEVICE)
+
+
+def build_optim_sched(model, epochs=EPOCHS):
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    warmup = LinearLR(optimizer, start_factor=0.1, total_iters=WARMUP_EPOCHS)
+    cosine = CosineAnnealingLR(optimizer, T_max=max(1, epochs - WARMUP_EPOCHS))
+    scheduler = SequentialLR(optimizer, [warmup, cosine], milestones=[WARMUP_EPOCHS])
+    return optimizer, scheduler
+
+
+def train_supervised(tag, csv_file, root_dir, epochs=EPOCHS):
+    print(f"\n{'='*70}\n Training: {tag}  |  backbone={MODEL_NAME}\n{'='*70}")
+
+    train_loader, val_loader = make_loaders(csv_file, root_dir)
+
+    model = build_model()
+    criterion = FocalLoss(alpha=FOCAL_ALPHA, gamma=FOCAL_GAMMA,
+                          label_smoothing=LABEL_SMOOTHING)
+    optimizer, scheduler = build_optim_sched(model, epochs)
+    scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE.type == "cuda"))
+
+    best_f1, best_state, wait = -1.0, None, 0
+    history = []
+
+    for epoch in range(1, epochs + 1):
+        t0 = time.time()
+        tr_loss, tr_acc = train_one_epoch(model, train_loader, optimizer, scaler, criterion)
+        val_m = evaluate(model, val_loader, criterion, use_tta=False)
+        scheduler.step()
+
+        log = {"epoch": epoch, "train_loss": tr_loss, "train_acc": tr_acc,
+               "lr": optimizer.param_groups[0]["lr"], **val_m,
+               "time_s": round(time.time() - t0, 1)}
+        history.append(log)
+        print(f"Epoch {epoch:02d} | tr_loss={tr_loss:.4f} tr_acc={tr_acc:.4f} "
+              f"| val_acc={val_m['accuracy']:.4f} val_f1={val_m['f1']:.4f} "
+              f"val_auroc={val_m['auroc']:.4f} | {log['time_s']}s")
+
+        if val_m["f1"] > best_f1:
+            best_f1 = val_m["f1"]
+            best_state = copy.deepcopy(model.state_dict())
+            torch.save(best_state, CKPT_DIR / f"{tag}.pth")
+            wait = 0
+        else:
+            wait += 1
+            if wait >= EARLY_STOP_PATIENCE:
+                print(f"[{tag}] Early stopping at epoch {epoch}")
+                break
+
+    # Restore best for reporting
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    with open(RESULTS_DIR / f"history_{tag}.json", "w") as f:
+        json.dump(history, f, indent=2)
+
+    print(f"\n[{tag}] Best val F1 = {best_f1:.4f}")
+    return model, best_f1, history
