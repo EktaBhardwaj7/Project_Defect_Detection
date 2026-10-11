@@ -1,7 +1,7 @@
-"""cross_dataset.py — train on one dataset, test on the other (domain shift).
+"""cross_dataset.py — train on one dataset, test on the other.
 
 Usage:
-    python cross_dataset.py --run mvtec_resnet18 --target visa
+    python cross_dataset.py --run mvtec_convnext_tiny --target visa
     python cross_dataset.py --all
 """
 
@@ -32,8 +32,7 @@ def _parse_run_name(run_name: str):
 
 def cross_eval(run_name: str, target_dataset: str, split: str = 'test',
                device=None, verbose: bool = True) -> dict:
-    """Load a checkpoint trained on the source dataset, evaluate on target."""
-    run_dir = Path(OUT_DIR) / run_name
+    run_dir   = Path(OUT_DIR) / run_name
     ckpt_path = run_dir / f'{run_name}_best.pt'
     if not ckpt_path.exists():
         raise FileNotFoundError(f'checkpoint not found: {ckpt_path}')
@@ -41,21 +40,21 @@ def cross_eval(run_name: str, target_dataset: str, split: str = 'test',
     ckpt = torch.load(ckpt_path, map_location='cpu')
     meta = ckpt.get('meta', {}) or {}
     source = meta.get('dataset') or _parse_run_name(run_name)[0]
-    arch = meta.get('arch') or _parse_run_name(run_name)[1]
+    arch   = meta.get('arch')    or _parse_run_name(run_name)[1]
 
     if target_dataset == source:
         raise ValueError('source and target datasets are the same')
 
     device = device or get_device()
-    model = build_model(arch, NUM_CLASSES, pretrained=False).to(device)
+    model  = build_model(arch, NUM_CLASSES, pretrained=False).to(device)
     model.load_state_dict(ckpt['model_state'])
     model.eval()
 
-    df = load_split(target_dataset, split)
+    df     = load_split(target_dataset, split)
     loader = make_loader(df, eval_transform(), shuffle=False, device=device)
-    criterion = get_loss('ce')
+    crit   = get_loss('ce')
 
-    res = evaluate(model, loader, criterion, device)
+    res = evaluate(model, loader, crit, device)
     out = {'run': run_name, 'source': source, 'target': target_dataset,
            'arch': arch, 'split': split, 'n': int(len(df)), **res}
 
@@ -71,12 +70,11 @@ def cross_eval(run_name: str, target_dataset: str, split: str = 'test',
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--run', default=None, help='e.g. mvtec_resnet18')
+    ap.add_argument('--run', default=None)
     ap.add_argument('--target', default=None, choices=DATASETS)
     ap.add_argument('--split', default='test',
                     choices=['train', 'val', 'test'])
-    ap.add_argument('--all', action='store_true',
-                    help='run every source/target/arch combination')
+    ap.add_argument('--all', action='store_true')
     args = ap.parse_args()
 
     print_config()
@@ -86,9 +84,9 @@ def main():
         for src in DATASETS:
             tgt = 'visa' if src == 'mvtec' else 'mvtec'
             for arch in ARCHS:
-                run_name = f'{src}_{arch}'
+                run = f'{src}_{arch}'
                 try:
-                    r = cross_eval(run_name, tgt, args.split)
+                    r = cross_eval(run, tgt, args.split)
                 except FileNotFoundError as e:
                     print(f'  [skip] {e}')
                     continue
@@ -104,7 +102,6 @@ def main():
 
     if not (args.run and args.target):
         ap.error('need --run and --target, or --all')
-
     res = cross_eval(args.run, args.target, args.split)
     print(json.dumps(res, indent=2))
 

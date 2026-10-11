@@ -1,8 +1,7 @@
 """evaluate.py — evaluate a saved checkpoint on a split.
 
 Usage:
-    python evaluate.py --run mvtec_resnet18 --split test
-    python evaluate.py --run visa_mobilenet_v3_small
+    python evaluate.py --run mvtec_convnext_tiny --split test
 """
 
 from __future__ import annotations
@@ -25,13 +24,14 @@ from train import load_split
 def _split_run_name(run_name: str):
     parts = run_name.split('_', 1)
     if len(parts) != 2:
-        raise ValueError(f'run name must look like "<dataset>_<arch>", got {run_name!r}')
+        raise ValueError(f'run name must look like "<dataset>_<arch>", '
+                         f'got {run_name!r}')
     return parts[0], parts[1]
 
 
 def evaluate_run(run_name: str, split: str = 'test', device=None,
                  verbose: bool = True) -> dict:
-    run_dir = Path(OUT_DIR) / run_name
+    run_dir   = Path(OUT_DIR) / run_name
     ckpt_path = run_dir / f'{run_name}_best.pt'
     if not ckpt_path.exists():
         raise FileNotFoundError(f'checkpoint not found: {ckpt_path}')
@@ -39,18 +39,18 @@ def evaluate_run(run_name: str, split: str = 'test', device=None,
     ckpt = torch.load(ckpt_path, map_location='cpu')
     meta = ckpt.get('meta', {}) or {}
     dataset = meta.get('dataset') or _split_run_name(run_name)[0]
-    arch = meta.get('arch') or _split_run_name(run_name)[1]
+    arch    = meta.get('arch')    or _split_run_name(run_name)[1]
 
     device = device or get_device()
-    model = build_model(arch, NUM_CLASSES, pretrained=False).to(device)
+    model  = build_model(arch, NUM_CLASSES, pretrained=False).to(device)
     model.load_state_dict(ckpt['model_state'])
     model.eval()
 
-    df = load_split(dataset, split)
+    df     = load_split(dataset, split)
     loader = make_loader(df, eval_transform(), shuffle=False, device=device)
-    criterion = get_loss('ce')
+    crit   = get_loss('ce')
 
-    res = evaluate(model, loader, criterion, device)
+    res = evaluate(model, loader, crit, device)
     out = {'run': run_name, 'dataset': dataset, 'arch': arch, 'split': split,
            'n': int(len(df)), 'ckpt_epoch': ckpt.get('epoch'),
            'ckpt_val_f1': ckpt.get('val_f1'), **res}
@@ -73,8 +73,7 @@ def evaluate_run(run_name: str, split: str = 'test', device=None,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--run', required=True,
-                    help='e.g. mvtec_resnet18')
+    ap.add_argument('--run', required=True)
     ap.add_argument('--split', default='test',
                     choices=['train', 'val', 'test'])
     args = ap.parse_args()

@@ -1,8 +1,7 @@
 """train.py — train one (dataset, arch) run.
 
 Usage:
-    python train.py --dataset mvtec --arch resnet18
-    python train.py --dataset visa  --arch mobilenet_v3_small --epochs 20
+    python train.py --dataset mvtec --arch convnext_tiny
 """
 
 from __future__ import annotations
@@ -18,9 +17,9 @@ import torch
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from config import (ARCHS, BATCH_SIZE, EPOCHS, LOSS_NAME, LR_BACKBONE, LR_HEAD,
-                    NUM_CLASSES, OUT_DIR, SEED, SPLIT_FILES, WEIGHT_DECAY,
-                    print_config)
+from config import (ARCHS, BATCH_SIZE, EPOCHS, LOSS_NAME, LR_BACKBONE,
+                    LR_HEAD, NUM_CLASSES, OUT_DIR, SEED, SPLIT_FILES,
+                    WEIGHT_DECAY, print_config)
 from dataset import eval_transform, make_loader, train_transform
 from engine import fit, get_device, save_json
 from losses import class_weights_from_df, get_loss
@@ -35,16 +34,15 @@ def set_seed(seed: int = SEED):
 
 
 def load_split(dataset: str, split: str) -> pd.DataFrame:
-    """Read one of our split CSVs from member2_supervised/splits/."""
     csv = Path(SPLIT_FILES[dataset][split])
     if not csv.exists():
         raise FileNotFoundError(
             f'{csv} not found — build splits first '
-            f'(notebook 05_create_splits.ipynb or run_all.py --splits-only).')
+            f'(run_all.py --splits-only or the Colab script).')
     return pd.read_csv(csv)
 
 
-def train_run(dataset: str = 'mvtec', arch: str = 'resnet18',
+def train_run(dataset: str = 'mvtec', arch: str = 'convnext_tiny',
               epochs: int = EPOCHS, loss_name: str = LOSS_NAME,
               batch_size: int = None, lr_backbone: float = LR_BACKBONE,
               lr_head: float = LR_HEAD, weight_decay: float = WEIGHT_DECAY,
@@ -54,35 +52,34 @@ def train_run(dataset: str = 'mvtec', arch: str = 'resnet18',
     bs = batch_size or BATCH_SIZE
 
     train_df = load_split(dataset, 'train')
-    val_df = load_split(dataset, 'val')
+    val_df   = load_split(dataset, 'val')
     if train_df['label'].nunique() < 2:
-        raise RuntimeError(f'{dataset} train split has only one class — '
-                           f'check splits/{dataset}_supervised_train.csv')
+        raise RuntimeError(f'{dataset} train split has only one class')
 
     train_loader = make_loader(train_df, train_transform(), shuffle=True,
                                batch_size=bs, device=device)
-    val_loader = make_loader(val_df, eval_transform(), shuffle=False,
-                             batch_size=bs, device=device)
+    val_loader   = make_loader(val_df, eval_transform(), shuffle=False,
+                               batch_size=bs, device=device)
 
     model = build_model(arch, NUM_CLASSES, pretrained=True).to(device)
-    backbone_p, head_p = get_param_groups(model, arch)
+    bb_p, hd_p = get_param_groups(model, arch)
     optimizer = Adam(
-        [{'params': backbone_p, 'lr': lr_backbone},
-         {'params': head_p, 'lr': lr_head}],
-        weight_decay=weight_decay,
-    )
+        [{'params': bb_p, 'lr': lr_backbone},
+         {'params': hd_p, 'lr': lr_head}],
+        weight_decay=weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
 
-    weights = class_weights_from_df(train_df, NUM_CLASSES)
+    weights   = class_weights_from_df(train_df, NUM_CLASSES)
     criterion = get_loss(loss_name, weights.to(device))
 
     run_name = f'{dataset}_{arch}'
-    run_dir = Path(OUT_DIR) / run_name
+    run_dir  = Path(OUT_DIR) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
     meta = {'dataset': dataset, 'arch': arch, 'loss': loss_name,
-            'epochs': epochs, 'batch_size': bs, 'lr_backbone': lr_backbone,
-            'lr_head': lr_head, 'weight_decay': weight_decay,
+            'epochs': epochs, 'batch_size': bs,
+            'lr_backbone': lr_backbone, 'lr_head': lr_head,
+            'weight_decay': weight_decay,
             'num_train': int(len(train_df)), 'num_val': int(len(val_df)),
             'class_weights': weights.tolist()}
 
@@ -119,9 +116,6 @@ def main():
     ap.add_argument('--patience', type=int, default=5)
     ap.add_argument('--quiet', action='store_true')
     args = ap.parse_args()
-
-    if args.arch not in ARCHS:
-        print(f'  warning: {args.arch!r} not in config.ARCHS {ARCHS}')
 
     print_config()
     meta = train_run(args.dataset, args.arch, epochs=args.epochs,

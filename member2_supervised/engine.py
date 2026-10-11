@@ -1,4 +1,4 @@
-"""engine.py — train / eval loops and metrics."""
+"""engine.py — train/eval loops + metrics."""
 
 from __future__ import annotations
 
@@ -11,8 +11,7 @@ import torch
 from sklearn.metrics import (accuracy_score, confusion_matrix, f1_score,
                              precision_score, recall_score, roc_auc_score)
 
-# --- AMP compatibility (torch >= 2.0 vs older) ----------------------
-try:  # pragma: no cover
+try:
     from torch.amp import GradScaler as _GradScaler
     from torch.amp import autocast as _autocast
 
@@ -21,8 +20,7 @@ try:  # pragma: no cover
 
     def autocast_ctx(enabled: bool):
         return _autocast('cuda', enabled=enabled)
-
-except ImportError:  # pragma: no cover
+except ImportError:
     from torch.cuda.amp import GradScaler as _GradScaler
     from torch.cuda.amp import autocast as _autocast
 
@@ -37,9 +35,6 @@ def get_device():
     return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-# ------------------------------------------------------------------
-# metrics
-# ------------------------------------------------------------------
 def compute_metrics(y_true, y_pred, y_prob=None) -> dict:
     m = {
         'accuracy':  float(accuracy_score(y_true, y_pred)),
@@ -57,9 +52,6 @@ def compute_metrics(y_true, y_pred, y_prob=None) -> dict:
     return m
 
 
-# ------------------------------------------------------------------
-# one epoch
-# ------------------------------------------------------------------
 def _run_epoch(model, loader, criterion, device,
                optimizer=None, scaler=None, grad_clip=None):
     training = optimizer is not None
@@ -68,9 +60,8 @@ def _run_epoch(model, loader, criterion, device,
     total_loss, n = 0.0, 0
     labels, preds, probs = [], [], []
 
-    prev_grad = torch.is_grad_enabled()
+    prev = torch.is_grad_enabled()
     torch.set_grad_enabled(training)
-
     try:
         for x, y in loader:
             x = x.to(device, non_blocking=True)
@@ -106,30 +97,25 @@ def _run_epoch(model, loader, criterion, device,
             preds.append(p.argmax(dim=1).cpu().numpy())
             labels.append(y.detach().cpu().numpy())
     finally:
-        torch.set_grad_enabled(prev_grad)
+        torch.set_grad_enabled(prev)
 
     y_true = np.concatenate(labels)
     y_pred = np.concatenate(preds)
-    y_prob = np.concatenate(probs)[:, 1]
+    y_prob = np.concatenate(probs)[:, 1] if np.concatenate(probs).shape[1] > 1 \
+             else np.concatenate(probs)[:, 0]
 
     return total_loss / max(n, 1), compute_metrics(y_true, y_pred, y_prob)
 
 
 def evaluate(model, loader, criterion, device):
-    """Returns a flat dict: {'loss': ..., 'accuracy': ..., ...}."""
     loss, metrics = _run_epoch(model, loader, criterion, device)
     return {'loss': float(loss), **metrics}
 
 
-# ------------------------------------------------------------------
-# full training loop
-# ------------------------------------------------------------------
 def fit(model, train_loader, val_loader, criterion, optimizer, device,
         epochs: int, scheduler=None, ckpt_dir=None, run_name: str = 'run',
         patience: int = 5, grad_clip: float = 5.0, use_amp: bool = True,
         meta: dict = None, verbose: bool = True):
-    """Train with early stopping on val F1. Saves best/last checkpoints."""
-
     ckpt_dir = Path(ckpt_dir) if ckpt_dir else None
     if ckpt_dir:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -138,7 +124,7 @@ def fit(model, train_loader, val_loader, criterion, optimizer, device,
     meta = meta or {}
 
     history = []
-    best_f1, best_epoch, epochs_no_improve = -1.0, -1, 0
+    best_f1, best_epoch, no_improve = -1.0, -1, 0
 
     for epoch in range(1, epochs + 1):
         t0 = time.time()
@@ -152,14 +138,12 @@ def fit(model, train_loader, val_loader, criterion, optimizer, device,
             scheduler.step()
 
         lr = optimizer.param_groups[0]['lr']
-        rec = {
-            'epoch': epoch, 'lr': lr,
-            'train_loss': tr_loss, 'val_loss': va_loss,
-            'train_acc': tr_m['accuracy'], 'train_f1': tr_m['f1'],
-            'val_acc': va_m['accuracy'], 'val_f1': va_m['f1'],
-            'val_auc': va_m['auc'],
-            'secs': round(time.time() - t0, 1),
-        }
+        rec = {'epoch': epoch, 'lr': lr,
+               'train_loss': tr_loss, 'val_loss': va_loss,
+               'train_acc': tr_m['accuracy'], 'train_f1': tr_m['f1'],
+               'val_acc': va_m['accuracy'], 'val_f1': va_m['f1'],
+               'val_auc': va_m['auc'],
+               'secs': round(time.time() - t0, 1)}
         history.append(rec)
 
         if verbose:
@@ -170,24 +154,22 @@ def fit(model, train_loader, val_loader, criterion, optimizer, device,
 
         score = va_m['f1']
         if score > best_f1:
-            best_f1, best_epoch, epochs_no_improve = score, epoch, 0
+            best_f1, best_epoch, no_improve = score, epoch, 0
             if ckpt_dir:
                 torch.save({'model_state': model.state_dict(),
-                            'epoch': epoch, 'val_f1': best_f1,
-                            'meta': meta},
+                            'epoch': epoch, 'val_f1': best_f1, 'meta': meta},
                            ckpt_dir / f'{run_name}_best.pt')
         else:
-            epochs_no_improve += 1
+            no_improve += 1
 
         if ckpt_dir:
             torch.save({'model_state': model.state_dict(),
                         'epoch': epoch, 'val_f1': best_f1, 'meta': meta},
                        ckpt_dir / f'{run_name}_last.pt')
 
-        if patience and epochs_no_improve >= patience:
+        if patience and no_improve >= patience:
             if verbose:
-                print(f'  early stop at epoch {epoch} '
-                      f'(no val-F1 improvement for {patience} epochs)')
+                print(f'  early stop at epoch {epoch}')
             break
 
     return {'history': history, 'best_f1': best_f1, 'best_epoch': best_epoch}

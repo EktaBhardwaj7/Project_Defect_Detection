@@ -1,19 +1,22 @@
 """
-data_utils.py — your own copy of CSV / path helpers.
-Reads metadata CSVs (read-only), resolves image paths against DATASETS_DIR.
+data_utils.py — reads Member 1's metadata, resolves image paths.
+
+Member 1's metadata uses:
+    datasets/mvtec_anomaly_detection/<cat>/...
+    datasets/VisA_20220922/<cat>/...
+
+Real Drive layout:
+    <MVTEC_ROOT>/<cat>/...
+    <VISA_ROOT>/<cat>/...
 """
 
 from pathlib import Path
 import pandas as pd
 
-from config import DATASETS_DIR
+from config import MVTEC_ROOT, VISA_ROOT, DATASETS_DIR
 
 
 def resolve_path(rel):
-    """
-    Turn a relative path from the metadata CSV into an absolute Path.
-    Tries DATASETS_DIR first, then DATASETS_DIR.parent.
-    """
     if rel is None:
         return None
     if isinstance(rel, float) and pd.isna(rel):
@@ -26,24 +29,31 @@ def resolve_path(rel):
     if p.is_absolute() and p.exists():
         return p
 
-    parts = p.parts
-    if parts and parts[0] == 'datasets':
-        p = Path(*parts[1:])
+    parts = list(p.parts)
+    if parts and parts[0].lower() == 'datasets':
+        parts = parts[1:]
+    if not parts:
+        return None
 
-    for base in (DATASETS_DIR, DATASETS_DIR.parent):
-        cand = base / p
-        if cand.exists():
-            return cand
-    return None
+    top = parts[0]
+    if top == 'mvtec_anomaly_detection':
+        base = MVTEC_ROOT
+    elif top == 'VisA_20220922':
+        base = VISA_ROOT
+    else:
+        base = DATASETS_DIR
+
+    cand = base / Path(*parts)
+    return cand if cand.exists() else None
 
 
 def load_metadata(csv_path) -> pd.DataFrame:
-    """Read metadata CSV, resolve paths, drop rows whose image is missing."""
     csv_path = Path(csv_path)
     df = pd.read_csv(csv_path)
+
     if 'image_path' not in df.columns:
-        raise KeyError(f"{csv_path.name} has no 'image_path' column "
-                       f"(columns: {list(df.columns)})")
+        raise KeyError(f"{csv_path.name}: no 'image_path' column "
+                       f"(cols={list(df.columns)})")
 
     df['abs_path'] = df['image_path'].apply(resolve_path)
     n_missing = int(df['abs_path'].isna().sum())
@@ -59,7 +69,7 @@ def load_metadata(csv_path) -> pd.DataFrame:
 
 
 def pick_valid_category(df: pd.DataFrame, preferred: str) -> str:
-    """Return a category that has both label=0 and label=1."""
+    """Category that has both label 0 and label 1."""
     if 'category' not in df.columns:
         raise KeyError("metadata has no 'category' column")
     g = df.groupby('category')['label'].agg(['nunique', 'count'])

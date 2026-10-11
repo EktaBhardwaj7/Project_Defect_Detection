@@ -31,8 +31,6 @@ def eval_transform():
 
 
 class DefectDataset(Dataset):
-    """Binary classification dataset backed by a split CSV."""
-
     def __init__(self, df: pd.DataFrame, transform=None):
         self.df = df.reset_index(drop=True)
         self.transform = transform
@@ -44,20 +42,14 @@ class DefectDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        path = row['abs_path']
-
-        # abs_path may be a string after read_csv
-        img = Image.open(str(path)).convert('RGB')
+        img = Image.open(str(row['abs_path'])).convert('RGB')
         if self.transform is not None:
             img = self.transform(img)
-
-        label = int(row['label'])
-        return img, label
+        return img, int(row['label'])
 
 
 def make_loader(df: pd.DataFrame, transform, shuffle: bool = False,
                 batch_size: int = None, device=None, num_workers: int = None):
-    """Build a DataLoader from a split DataFrame."""
     bs = batch_size or BATCH_SIZE
     nw = NUM_WORKERS if num_workers is None else num_workers
     pin = bool(device is not None and getattr(device, 'type', '') == 'cuda')

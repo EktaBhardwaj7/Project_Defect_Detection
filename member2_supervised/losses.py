@@ -8,8 +8,6 @@ from config import FOCAL_GAMMA, NUM_CLASSES
 
 
 class FocalLoss(nn.Module):
-    """Multi-class focal loss with optional per-class weights."""
-
     def __init__(self, gamma: float = 2.0, weight: torch.Tensor = None,
                  reduction: str = 'mean'):
         super().__init__()
@@ -21,10 +19,10 @@ class FocalLoss(nn.Module):
             self.weight = None
 
     def forward(self, logits, targets):
-        logp = F.log_softmax(logits, dim=1)
+        logp  = F.log_softmax(logits, dim=1)
         logpt = logp.gather(1, targets.unsqueeze(1)).squeeze(1)
-        pt = logpt.exp()
-        loss = -((1.0 - pt) ** self.gamma) * logpt
+        pt    = logpt.exp()
+        loss  = -((1.0 - pt) ** self.gamma) * logpt
 
         if self.weight is not None:
             loss = loss * self.weight.to(logits.device).gather(0, targets)
@@ -37,7 +35,6 @@ class FocalLoss(nn.Module):
 
 
 def class_weights_from_df(df, num_classes: int = NUM_CLASSES) -> torch.Tensor:
-    """Inverse-frequency weights: w_c = N / (C * n_c)."""
     counts = df['label'].value_counts().to_dict()
     n = max(len(df), 1)
     w = []
@@ -49,15 +46,10 @@ def class_weights_from_df(df, num_classes: int = NUM_CLASSES) -> torch.Tensor:
 
 def get_loss(name: str = 'ce_balanced', class_weights: torch.Tensor = None):
     name = (name or '').lower()
-
     if name in ('ce', 'cross_entropy', 'crossentropy'):
         return nn.CrossEntropyLoss()
-
     if name in ('ce_balanced', 'ce_weighted', 'weighted_ce'):
         return nn.CrossEntropyLoss(weight=class_weights)
-
     if name in ('focal', 'focal_loss'):
         return FocalLoss(gamma=FOCAL_GAMMA, weight=class_weights)
-
-    raise ValueError(f'Unknown loss {name!r}. '
-                     f"Use one of: 'ce', 'ce_balanced', 'focal'.")
+    raise ValueError(f'Unknown loss {name!r}')

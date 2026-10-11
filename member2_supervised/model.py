@@ -1,23 +1,25 @@
-"""model.py — torchvision backbones with a fresh binary head."""
+"""model.py — torchvision backbones with a fresh binary head (ConvNeXt support)."""
 
 import torch.nn as nn
 from torchvision import models
 
 from config import NUM_CLASSES
 
-# Which module is the classification head for each arch
 HEAD_MODULE = {
     'resnet18': 'fc',
     'resnet34': 'fc',
     'resnet50': 'fc',
     'mobilenet_v3_small': 'classifier',
     'mobilenet_v3_large': 'classifier',
+    'convnext_tiny':  'classifier',
+    'convnext_small': 'classifier',
+    'convnext_base':  'classifier',
 }
 
-try:  # torchvision >= 0.13
+try:
     models.resnet18(weights=None)
     _HAS_WEIGHTS_ARG = True
-except TypeError:  # pragma: no cover
+except TypeError:
     _HAS_WEIGHTS_ARG = False
 
 
@@ -27,7 +29,8 @@ def _w(pretrained: bool):
     return {'pretrained': bool(pretrained)}
 
 
-def build_model(arch: str = 'resnet18', num_classes: int = NUM_CLASSES,
+def build_model(arch: str = 'convnext_tiny',
+                num_classes: int = NUM_CLASSES,
                 pretrained: bool = True) -> nn.Module:
     arch = arch.lower()
 
@@ -42,12 +45,17 @@ def build_model(arch: str = 'resnet18', num_classes: int = NUM_CLASSES,
         m.classifier[-1] = nn.Linear(in_f, num_classes)
         return m
 
+    if arch.startswith('convnext'):
+        m = getattr(models, arch)(**_w(pretrained))
+        in_f = m.classifier[-1].in_features
+        m.classifier[-1] = nn.Linear(in_f, num_classes)
+        return m
+
     raise ValueError(f'Unsupported arch {arch!r}. '
                      f'Choose from {sorted(HEAD_MODULE)}')
 
 
 def get_param_groups(model: nn.Module, arch: str):
-    """Split trainable params into (backbone, head) for differential LRs."""
     arch = arch.lower()
     if arch not in HEAD_MODULE:
         raise ValueError(f'Unsupported arch {arch!r}')
