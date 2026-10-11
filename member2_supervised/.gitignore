@@ -1,7 +1,8 @@
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 .ipynb_checkpoints/
+.DS_Store
+
+# generated artifacts
 outputs/
-*.zip
-*.pth
+splits/*.csv

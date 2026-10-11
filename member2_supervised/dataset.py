@@ -1,85 +1,75 @@
-# member2_supervised/dataset.py
-import os
+"""dataset.py — torch Dataset + transforms + DataLoader factory."""
+
+from pathlib import Path
+
 import pandas as pd
 import torch
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+
+from config import BATCH_SIZE, IMG_SIZE, MEAN, NUM_WORKERS, STD
+
+
+def train_transform():
+    return transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2),
+        transforms.ToTensor(),
+        transforms.Normalize(MEAN, STD),
+    ])
+
+
+def eval_transform():
+    return transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize(MEAN, STD),
+    ])
 
 
 class DefectDataset(Dataset):
-    """
-    Binary image-level classifier dataset.
-    Reads team metadata CSV, remaps Windows paths to Colab/Kaggle paths.
-    """
-    def __init__(self, csv_file, root_dir, split=None, transform=None,
-                 return_path=False):
-        self.df = pd.read_csv(csv_file)
-        if split is not None and "split" in self.df.columns:
-            self.df = self.df[self.df["split"] == split].reset_index(drop=True)
+    """Binary classification dataset backed by a split CSV."""
 
-        self.root_dir = str(root_dir)
+    def __init__(self, df: pd.DataFrame, transform=None):
+        self.df = df.reset_index(drop=True)
         self.transform = transform
-        self.return_path = return_path
-
-        # Remap paths
-        self.df["full_path"] = self.df["image_path"].apply(self._remap)
-        self.df["mask_full_path"] = self.df["mask_path"].apply(self._remap)
-
-        # Drop missing files
-        before = len(self.df)
-        self.df = self.df[self.df["full_path"].apply(os.path.exists)].reset_index(drop=True)
-        if before != len(self.df):
-            print(f"[DefectDataset] Dropped {before - len(self.df)} missing files "
-                  f"({len(self.df)} remain) from {csv_file}")
-
-    def _remap(self, p):
-        if pd.isna(p) or p == "" or p is None:
-            return ""
-        p = str(p).replace("\\", "/")
-        for key in ("mvtec_anomaly_detection/", "VisA_20220922/"):
-            if key in p:
-                rel = p.split(key, 1)[1]
-                return os.path.join(self.root_dir, rel)
-        return p
+        if 'abs_path' not in self.df.columns:
+            raise KeyError("split CSV must contain an 'abs_path' column")
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        try:
-            img = Image.open(row["full_path"]).convert("RGB")
-        except Exception:
-            img = Image.new("RGB", (288, 288))
+        path = row['abs_path']
 
-        label = int(row["label"])
-        if self.transform:
+        # abs_path may be a string after read_csv
+        img = Image.open(str(path)).convert('RGB')
+        if self.transform is not None:
             img = self.transform(img)
 
-        if self.return_path:
-            return img, torch.tensor(label, dtype=torch.long), row["full_path"]
-        return img, torch.tensor(label, dtype=torch.long)
+        label = int(row['label'])
+        return img, label
 
 
-def build_transforms(img_size=288, train=True):
-    normalize = transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std =[0.229, 0.224, 0.225],
+def make_loader(df: pd.DataFrame, transform, shuffle: bool = False,
+                batch_size: int = None, device=None, num_workers: int = None):
+    """Build a DataLoader from a split DataFrame."""
+    bs = batch_size or BATCH_SIZE
+    nw = NUM_WORKERS if num_workers is None else num_workers
+    pin = bool(device is not None and getattr(device, 'type', '') == 'cuda')
+
+    ds = DefectDataset(df, transform)
+    drop_last = shuffle and len(ds) > bs and (len(ds) % bs == 1)
+
+    return DataLoader(
+        ds,
+        batch_size=bs,
+        shuffle=shuffle,
+        num_workers=nw,
+        pin_memory=pin,
+        drop_last=drop_last,
     )
-    if train:
-        return transforms.Compose([
-            transforms.Resize((img_size, img_size)),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(),
-            transforms.RandomRotation(15),
-            transforms.ColorJitter(0.2, 0.2, 0.2, 0.05),
-            transforms.ToTensor(),
-            normalize,
-            transforms.RandomErasing(p=0.25, scale=(0.02, 0.1)),
-        ])
-    return transforms.Compose([
-        transforms.Resize((img_size, img_size)),
-        transforms.ToTensor(),
-        normalize,
-    ])

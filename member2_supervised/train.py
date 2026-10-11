@@ -1,98 +1,134 @@
-# member2_supervised/train.py
-import copy, json, time
+"""train.py — train one (dataset, arch) run.
+
+Usage:
+    python train.py --dataset mvtec --arch resnet18
+    python train.py --dataset visa  --arch mobilenet_v3_small --epochs 20
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim import Adam
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from config import (IMG_SIZE, BATCH_SIZE, EPOCHS, LR, WEIGHT_DECAY, WARMUP_EPOCHS,
-                    LABEL_SMOOTHING, NUM_WORKERS, DEVICE, CKPT_DIR, RESULTS_DIR,
-                    MODEL_NAME, NUM_CLASSES, PRETRAINED, DROPOUT,
-                    FOCAL_ALPHA, FOCAL_GAMMA, EARLY_STOP_PATIENCE)
-from dataset import DefectDataset, build_transforms
-from model import DefectClassifier
-from losses import FocalLoss
-from engine import train_one_epoch, evaluate
+from config import (ARCHS, BATCH_SIZE, EPOCHS, LOSS_NAME, LR_BACKBONE, LR_HEAD,
+                    NUM_CLASSES, OUT_DIR, SEED, SPLIT_FILES, WEIGHT_DECAY,
+                    print_config)
+from dataset import eval_transform, make_loader, train_transform
+from engine import fit, get_device, save_json
+from losses import class_weights_from_df, get_loss
+from model import build_model, get_param_groups
 
 
-def make_loaders(csv_file, root_dir, img_size=IMG_SIZE, batch_size=BATCH_SIZE,
-                 val_frac=0.1):
-    train_full = DefectDataset(csv_file, root_dir, split="train",
-                               transform=build_transforms(img_size, True))
-    val_full = DefectDataset(csv_file, root_dir, split="train",
-                             transform=build_transforms(img_size, False))
-    n = len(train_full)
-    val_size = max(1, int(val_frac * n))
-    train_size = n - val_size
-    g = torch.Generator().manual_seed(42)
-    idx_train, idx_val = torch.randperm(n, generator=g).split([train_size, val_size])
-    train_subset = torch.utils.data.Subset(train_full, idx_train.tolist())
-    val_subset   = torch.utils.data.Subset(val_full,   idx_val.tolist())
-
-    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True,
-                              num_workers=NUM_WORKERS, pin_memory=True, drop_last=False)
-    val_loader   = DataLoader(val_subset, batch_size=batch_size, shuffle=False,
-                              num_workers=NUM_WORKERS, pin_memory=True)
-    return train_loader, val_loader
+def set_seed(seed: int = SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
-def build_model():
-    return DefectClassifier(MODEL_NAME, NUM_CLASSES, PRETRAINED, DROPOUT).to(DEVICE)
+def load_split(dataset: str, split: str) -> pd.DataFrame:
+    """Read one of our split CSVs from member2_supervised/splits/."""
+    csv = Path(SPLIT_FILES[dataset][split])
+    if not csv.exists():
+        raise FileNotFoundError(
+            f'{csv} not found — build splits first '
+            f'(notebook 05_create_splits.ipynb or run_all.py --splits-only).')
+    return pd.read_csv(csv)
 
 
-def build_optim_sched(model, epochs=EPOCHS):
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    warmup = LinearLR(optimizer, start_factor=0.1, total_iters=WARMUP_EPOCHS)
-    cosine = CosineAnnealingLR(optimizer, T_max=max(1, epochs - WARMUP_EPOCHS))
-    scheduler = SequentialLR(optimizer, [warmup, cosine], milestones=[WARMUP_EPOCHS])
-    return optimizer, scheduler
+def train_run(dataset: str = 'mvtec', arch: str = 'resnet18',
+              epochs: int = EPOCHS, loss_name: str = LOSS_NAME,
+              batch_size: int = None, lr_backbone: float = LR_BACKBONE,
+              lr_head: float = LR_HEAD, weight_decay: float = WEIGHT_DECAY,
+              patience: int = 5, device=None, verbose: bool = True) -> dict:
+    set_seed(SEED)
+    device = device or get_device()
+    bs = batch_size or BATCH_SIZE
+
+    train_df = load_split(dataset, 'train')
+    val_df = load_split(dataset, 'val')
+    if train_df['label'].nunique() < 2:
+        raise RuntimeError(f'{dataset} train split has only one class — '
+                           f'check splits/{dataset}_supervised_train.csv')
+
+    train_loader = make_loader(train_df, train_transform(), shuffle=True,
+                               batch_size=bs, device=device)
+    val_loader = make_loader(val_df, eval_transform(), shuffle=False,
+                             batch_size=bs, device=device)
+
+    model = build_model(arch, NUM_CLASSES, pretrained=True).to(device)
+    backbone_p, head_p = get_param_groups(model, arch)
+    optimizer = Adam(
+        [{'params': backbone_p, 'lr': lr_backbone},
+         {'params': head_p, 'lr': lr_head}],
+        weight_decay=weight_decay,
+    )
+    scheduler = CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
+
+    weights = class_weights_from_df(train_df, NUM_CLASSES)
+    criterion = get_loss(loss_name, weights.to(device))
+
+    run_name = f'{dataset}_{arch}'
+    run_dir = Path(OUT_DIR) / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    meta = {'dataset': dataset, 'arch': arch, 'loss': loss_name,
+            'epochs': epochs, 'batch_size': bs, 'lr_backbone': lr_backbone,
+            'lr_head': lr_head, 'weight_decay': weight_decay,
+            'num_train': int(len(train_df)), 'num_val': int(len(val_df)),
+            'class_weights': weights.tolist()}
+
+    if verbose:
+        print(f'\n=== {run_name} ===')
+        print(f'  train={len(train_df)}  val={len(val_df)}  device={device}')
+        print(f'  class counts (train): '
+              f'{train_df["label"].value_counts().to_dict()}')
+
+    result = fit(model, train_loader, val_loader, criterion, optimizer, device,
+                 epochs=epochs, scheduler=scheduler, ckpt_dir=run_dir,
+                 run_name=run_name, patience=patience, meta=meta,
+                 verbose=verbose)
+
+    meta.update({'best_val_f1': result['best_f1'],
+                 'best_epoch': result['best_epoch'],
+                 'device': str(device)})
+    save_json(result['history'], run_dir / 'history.json')
+    save_json(meta, run_dir / 'metrics.json')
+
+    if verbose:
+        print(f'  best val F1 = {result["best_f1"]:.4f} '
+              f'@ epoch {result["best_epoch"]}')
+    return meta
 
 
-def train_supervised(tag, csv_file, root_dir, epochs=EPOCHS):
-    print(f"\n{'='*70}\n Training: {tag}  |  backbone={MODEL_NAME}\n{'='*70}")
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--dataset', choices=['mvtec', 'visa'], default='mvtec')
+    ap.add_argument('--arch', default=ARCHS[0])
+    ap.add_argument('--epochs', type=int, default=EPOCHS)
+    ap.add_argument('--loss', default=LOSS_NAME)
+    ap.add_argument('--batch-size', type=int, default=None)
+    ap.add_argument('--patience', type=int, default=5)
+    ap.add_argument('--quiet', action='store_true')
+    args = ap.parse_args()
 
-    train_loader, val_loader = make_loaders(csv_file, root_dir)
+    if args.arch not in ARCHS:
+        print(f'  warning: {args.arch!r} not in config.ARCHS {ARCHS}')
 
-    model = build_model()
-    criterion = FocalLoss(alpha=FOCAL_ALPHA, gamma=FOCAL_GAMMA,
-                          label_smoothing=LABEL_SMOOTHING)
-    optimizer, scheduler = build_optim_sched(model, epochs)
-    scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE.type == "cuda"))
+    print_config()
+    meta = train_run(args.dataset, args.arch, epochs=args.epochs,
+                     loss_name=args.loss, batch_size=args.batch_size,
+                     patience=args.patience, verbose=not args.quiet)
+    print(json.dumps(meta, indent=2))
 
-    best_f1, best_state, wait = -1.0, None, 0
-    history = []
 
-    for epoch in range(1, epochs + 1):
-        t0 = time.time()
-        tr_loss, tr_acc = train_one_epoch(model, train_loader, optimizer, scaler, criterion)
-        val_m = evaluate(model, val_loader, criterion, use_tta=False)
-        scheduler.step()
-
-        log = {"epoch": epoch, "train_loss": tr_loss, "train_acc": tr_acc,
-               "lr": optimizer.param_groups[0]["lr"], **val_m,
-               "time_s": round(time.time() - t0, 1)}
-        history.append(log)
-        print(f"Epoch {epoch:02d} | tr_loss={tr_loss:.4f} tr_acc={tr_acc:.4f} "
-              f"| val_acc={val_m['accuracy']:.4f} val_f1={val_m['f1']:.4f} "
-              f"val_auroc={val_m['auroc']:.4f} | {log['time_s']}s")
-
-        if val_m["f1"] > best_f1:
-            best_f1 = val_m["f1"]
-            best_state = copy.deepcopy(model.state_dict())
-            torch.save(best_state, CKPT_DIR / f"{tag}.pth")
-            wait = 0
-        else:
-            wait += 1
-            if wait >= EARLY_STOP_PATIENCE:
-                print(f"[{tag}] Early stopping at epoch {epoch}")
-                break
-
-    # Restore best for reporting
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    with open(RESULTS_DIR / f"history_{tag}.json", "w") as f:
-        json.dump(history, f, indent=2)
-
-    print(f"\n[{tag}] Best val F1 = {best_f1:.4f}")
-    return model, best_f1, history
+if __name__ == '__main__':
+    main()

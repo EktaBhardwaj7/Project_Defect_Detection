@@ -1,20 +1,40 @@
-# Member 2 — Supervised Deep Learning
+# member2_supervised
 
-Binary image-level defect classification on MVTec AD and VisA.
+Supervised binary defect classification on MVTec-AD and VisA.
 
-**Backbone:** ConvNeXt-Tiny (timm, ImageNet-pretrained)
-**Loss:** Focal Loss (alpha=0.25, gamma=2.0)
-**Scheduler:** Linear warmup + Cosine annealing
-**Inference:** 4-view TTA, AMP
+**Self-contained:** everything here reads metadata (read-only) and writes
+splits/checkpoints/metrics *inside this folder*.
 
-**Experiments:**
-1. MVTec → MVTec
-2. VisA → VisA
-3. MVTec → VisA
-4. VisA → MVTec
+## Layout
+member2_supervised/
+├── config.py paths + hyper-params (only file that knows about paths)
+├── data_utils.py CSV loading + path resolution
+├── dataset.py torch Dataset / transforms / DataLoader
+├── model.py torchvision backbones + binary head
+├── losses.py class-balanced CE + focal loss
+├── engine.py train/eval loops + metrics
+├── train.py train one (dataset, arch)
+├── evaluate.py evaluate a checkpoint
+├── cross_dataset.py train on A, test on B
+├── run_all.py full pipeline
+├── splits/ generated split CSVs
+└── outputs/ checkpoints, history.json, metrics*.json, summary.csv
 
-**Metrics:** Accuracy, Precision, Recall, F1, AUROC, AP, Confusion Matrix
 
-**Run:** `python run_all.py` (metadata CSVs must be in `../metadata/`)
+## Quickstart
 
-Outputs go to `outputs/` (git-ignored).
+```bash
+cd /content/drive/MyDrive/IndustrialDefectProject/member2/member2_supervised
+
+# 0) verify paths
+python -c "from config import print_config; print_config()"
+
+# 1) build splits + train everything + evaluate + cross-test
+python run_all.py
+
+# or step by step:
+python run_all.py --splits-only
+python train.py    --dataset mvtec --arch resnet18
+python evaluate.py --run mvtec_resnet18 --split test
+python cross_dataset.py --run mvtec_resnet18 --target visa
+

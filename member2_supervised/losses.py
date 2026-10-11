@@ -1,27 +1,63 @@
-# member2_supervised/losses.py
+"""losses.py — class-balanced CE and focal loss."""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from config import FOCAL_GAMMA, NUM_CLASSES
+
 
 class FocalLoss(nn.Module):
-    """Focal Loss for class-imbalanced binary classification."""
-    def __init__(self, alpha=0.25, gamma=2.0, label_smoothing=0.0, reduction="mean"):
+    """Multi-class focal loss with optional per-class weights."""
+
+    def __init__(self, gamma: float = 2.0, weight: torch.Tensor = None,
+                 reduction: str = 'mean'):
         super().__init__()
-        self.alpha = alpha
         self.gamma = gamma
-        self.label_smoothing = label_smoothing
         self.reduction = reduction
+        if weight is not None:
+            self.register_buffer('weight', weight.float())
+        else:
+            self.weight = None
 
     def forward(self, logits, targets):
-        ce = F.cross_entropy(
-            logits, targets, reduction="none",
-            label_smoothing=self.label_smoothing,
-        )
-        pt = torch.exp(-ce)
-        loss = self.alpha * (1 - pt) ** self.gamma * ce
-        if self.reduction == "mean":
+        logp = F.log_softmax(logits, dim=1)
+        logpt = logp.gather(1, targets.unsqueeze(1)).squeeze(1)
+        pt = logpt.exp()
+        loss = -((1.0 - pt) ** self.gamma) * logpt
+
+        if self.weight is not None:
+            loss = loss * self.weight.to(logits.device).gather(0, targets)
+
+        if self.reduction == 'mean':
             return loss.mean()
-        if self.reduction == "sum":
+        if self.reduction == 'sum':
             return loss.sum()
         return loss
+
+
+def class_weights_from_df(df, num_classes: int = NUM_CLASSES) -> torch.Tensor:
+    """Inverse-frequency weights: w_c = N / (C * n_c)."""
+    counts = df['label'].value_counts().to_dict()
+    n = max(len(df), 1)
+    w = []
+    for c in range(num_classes):
+        nc = max(int(counts.get(c, 0)), 1)
+        w.append(n / (num_classes * nc))
+    return torch.tensor(w, dtype=torch.float32)
+
+
+def get_loss(name: str = 'ce_balanced', class_weights: torch.Tensor = None):
+    name = (name or '').lower()
+
+    if name in ('ce', 'cross_entropy', 'crossentropy'):
+        return nn.CrossEntropyLoss()
+
+    if name in ('ce_balanced', 'ce_weighted', 'weighted_ce'):
+        return nn.CrossEntropyLoss(weight=class_weights)
+
+    if name in ('focal', 'focal_loss'):
+        return FocalLoss(gamma=FOCAL_GAMMA, weight=class_weights)
+
+    raise ValueError(f'Unknown loss {name!r}. '
+                     f"Use one of: 'ce', 'ce_balanced', 'focal'.")
